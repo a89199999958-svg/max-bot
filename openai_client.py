@@ -27,7 +27,7 @@ async def transcribe_voice(audio_url: str, bot_token: str) -> str:
     async with httpx.AsyncClient(timeout=60) as http:
         resp = await http.get(
             audio_url,
-            headers={"Authorization": f"Bearer {bot_token}"},
+            headers={"Authorization": bot_token},
             follow_redirects=True,
         )
         resp.raise_for_status()

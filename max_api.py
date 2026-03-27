@@ -1,6 +1,7 @@
 """
 MAX Мессенджер API клиент.
 Base URL: https://platform-api.max.ru
+Авторизация: заголовок "Authorization: <token>" (без Bearer!)
 """
 import os
 import logging
@@ -13,7 +14,8 @@ BASE_URL = "https://platform-api.max.ru"
 
 
 def _headers() -> dict:
-    return {"Authorization": f"Bearer {MAX_BOT_TOKEN}"}
+    # MAX API: просто токен, без "Bearer"
+    return {"Authorization": MAX_BOT_TOKEN}
 
 
 async def send_text(chat_id: int, text: str) -> None:
