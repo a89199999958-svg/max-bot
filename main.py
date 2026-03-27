@@ -8,7 +8,7 @@ from fastapi import FastAPI, Request, Response
 
 load_dotenv()
 
-from handlers import handle_bot_started, handle_image, handle_text, handle_voice
+from handlers import dispatch
 
 logging.basicConfig(
     level=logging.INFO,
@@ -21,7 +21,6 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     logger.info("MAX Bot запущен. Ожидаю сообщения...")
     yield
-    logger.info("MAX Bot остановлен.")
 
 
 app = FastAPI(title="MAX GPT-4o Bot", lifespan=lifespan)
@@ -35,15 +34,16 @@ async def webhook(request: Request):
         return Response(status_code=400)
 
     update_type = body.get("update_type")
-    logger.debug("Event: %s", update_type)
 
+    # ── Пользователь запустил бота ─────────────────────────────────────────
     if update_type == "bot_started":
         chat_id = body.get("chat_id") or body.get("user", {}).get("user_id")
         user_name = body.get("user", {}).get("name", "друг")
         if chat_id:
-            await handle_bot_started(int(chat_id), user_name)
+            await dispatch(int(chat_id), user_name, "start")
         return {"ok": True}
 
+    # ── Новое сообщение ────────────────────────────────────────────────────
     if update_type == "message_created":
         message = body.get("message", {})
         if not message:
@@ -55,6 +55,7 @@ async def webhook(request: Request):
             return {"ok": True}
 
         chat_id = int(chat_id)
+        display_name = sender.get("name", "Незнакомец")
         body_msg = message.get("body", {})
         text = body_msg.get("text", "").strip()
         attachments = body_msg.get("attachments", [])
@@ -67,28 +68,22 @@ async def webhook(request: Request):
                 if att_type == "audio":
                     audio_url = payload.get("url")
                     if audio_url:
-                        logger.info("Voice from chat_id=%s", chat_id)
-                        await handle_voice(chat_id, audio_url)
+                        await dispatch(chat_id, display_name, "voice", audio_url=audio_url)
                     else:
-                        await _send_unsupported(chat_id)
+                        await _unsupported(chat_id, display_name)
 
                 elif att_type == "image":
-                    image_url = (
-                        payload.get("url")
-                        or _best_photo_url(payload)
-                    )
+                    image_url = payload.get("url") or _best_photo(payload)
                     if image_url:
-                        logger.info("Photo from chat_id=%s", chat_id)
-                        await handle_image(chat_id, image_url, text or None)
+                        await dispatch(chat_id, display_name, "image",
+                                       image_url=image_url, caption=text or None)
                     else:
-                        await _send_unsupported(chat_id)
-
+                        await _unsupported(chat_id, display_name)
                 else:
-                    await _send_unsupported(chat_id)
+                    await _unsupported(chat_id, display_name)
 
         elif text:
-            logger.info("Text from chat_id=%s: %s", chat_id, text[:80])
-            await handle_text(chat_id, text)
+            await dispatch(chat_id, display_name, "text", text=text)
 
     return {"ok": True}
 
@@ -98,15 +93,15 @@ async def health():
     return {"status": "ok", "bot": "max-gpt4o"}
 
 
-async def _send_unsupported(chat_id: int) -> None:
-    from max_api import send_text
-    await send_text(
-        chat_id,
-        "Извини, я понимаю только текст, голосовые сообщения и фотографии!"
-    )
+async def _unsupported(chat_id: int, display_name: str) -> None:
+    from user_registry import check_access
+    allowed, label, _, _ = check_access(chat_id, display_name)
+    if allowed:
+        from max_api import send_text
+        await send_text(chat_id, f"Извини, {label}, я понимаю только текст, голосовые и фото!")
 
 
-def _best_photo_url(payload: dict) -> str | None:
+def _best_photo(payload: dict) -> str | None:
     photos = payload.get("photos", {})
     for size in ("1280", "960", "800", "640", "320"):
         if size in photos:
