@@ -1,14 +1,13 @@
 """
-OpenAI клиент с поиском в интернете.
-GPT-4o сам решает когда нужен поиск — через function calling.
+OpenAI клиент с встроенным поиском OpenAI (Responses API).
+Тот же поиск что используется в ChatGPT — читает страницы целиком,
+перекрёстно проверяет источники, показывает ссылки.
 """
 import os
-import json
 import logging
 import tempfile
 import httpx
 from openai import AsyncOpenAI
-from ddgs import DDGS
 
 logger = logging.getLogger(__name__)
 client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
@@ -18,91 +17,69 @@ SYSTEM_PROMPT = os.getenv(
     "Ты умный и добрый помощник по имени Макс. Отвечай на русском языке, объясняй просто и понятно, как будто объясняешь близкому человеку. Будь вежливым и терпеливым. Если не знаешь ответа — честно скажи об этом.",
 )
 
-# ── Инструмент поиска для GPT ─────────────────────────────────────────────────
-SEARCH_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "search_web",
-        "description": (
-            "Искать актуальную информацию в интернете. Используй когда нужно узнать: "
-            "погоду, новости, курс валют, цены, расписание, события, текущее время/дату, "
-            "или любые данные которые могут измениться."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "Поисковый запрос (лучше на русском)"
-                }
-            },
-            "required": ["query"]
-        }
-    }
-}
-
-
-def _do_search(query: str) -> str:
-    """Выполнить поиск в DuckDuckGo и вернуть результаты как текст."""
-    try:
-        with DDGS() as ddgs:
-            results = list(ddgs.text(query, max_results=5))
-        if not results:
-            return "Поиск не дал результатов."
-        lines = [f"Результаты поиска по запросу «{query}»:\n"]
-        for i, r in enumerate(results, 1):
-            title = r.get("title", "")
-            body  = r.get("body", "")
-            href  = r.get("href", "")
-            lines.append(f"{i}. {title}\n   {body}\n   {href}\n")
-        return "\n".join(lines)
-    except Exception as e:
-        logger.warning("Ошибка поиска: %s", e)
-        return f"Не удалось выполнить поиск: {e}"
-
 
 async def ask_gpt(messages: list[dict]) -> str:
     """
-    Отправить историю диалога в GPT-4o.
-    GPT сам решает когда нужен поиск в интернете (function calling).
+    Отправить запрос через Responses API с встроенным поиском OpenAI.
+    GPT сам решает когда нужен поиск — поведение идентично ChatGPT.
     """
-    full_messages = [{"role": "system", "content": SYSTEM_PROMPT}] + messages
-
-    # Цикл: GPT может вызвать поиск несколько раз перед финальным ответом
-    for _ in range(5):
-        response = await client.chat.completions.create(
+    # Конвертируем историю диалога в единый текст для Responses API
+    # (Responses API принимает input как строку или список)
+    try:
+        response = await client.responses.create(
             model="gpt-4o",
-            messages=full_messages,
-            tools=[SEARCH_TOOL],
-            tool_choice="auto",
-            max_tokens=1500,
+            instructions=SYSTEM_PROMPT,
+            input=_messages_to_input(messages),
+            tools=[{"type": "web_search_preview"}],
         )
+        # Извлечь текст из ответа
+        return _extract_text(response)
+    except Exception as e:
+        # Если Responses API недоступен — fallback на Chat Completions без поиска
+        logger.warning("Responses API недоступен (%s), fallback на Chat Completions", e)
+        return await _ask_gpt_fallback(messages)
 
-        choice = response.choices[0]
 
-        # GPT хочет выполнить поиск
-        if choice.finish_reason == "tool_calls":
-            tool_calls = choice.message.tool_calls
-            full_messages.append(choice.message)  # сохраняем ответ ассистента с tool_calls
+def _messages_to_input(messages: list[dict]) -> list[dict]:
+    """Конвертировать историю в формат Responses API."""
+    result = []
+    for msg in messages:
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+        # Пропускаем tool-сообщения (не нужны в Responses API)
+        if role in ("user", "assistant"):
+            if isinstance(content, str):
+                result.append({"role": role, "content": content})
+            elif isinstance(content, list):
+                # Мультимодальный контент (фото) — берём только текст для истории
+                text_parts = [p.get("text", "") for p in content if p.get("type") == "text"]
+                if text_parts:
+                    result.append({"role": role, "content": " ".join(text_parts)})
+    return result if result else [{"role": "user", "content": "Привет"}]
 
-            for tc in tool_calls:
-                if tc.function.name == "search_web":
-                    args = json.loads(tc.function.arguments)
-                    query = args.get("query", "")
-                    logger.info("GPT ищет: %s", query)
-                    search_result = _do_search(query)
-                    # Возвращаем результат поиска GPT
-                    full_messages.append({
-                        "role": "tool",
-                        "tool_call_id": tc.id,
-                        "content": search_result,
-                    })
-            continue  # следующая итерация — GPT даст ответ на основе поиска
 
-        # GPT дал финальный ответ
-        return choice.message.content.strip()
+def _extract_text(response) -> str:
+    """Извлечь текстовый ответ из объекта Responses API."""
+    text_parts = []
+    for item in response.output:
+        if hasattr(item, "type") and item.type == "message":
+            for part in item.content:
+                if hasattr(part, "type") and part.type == "output_text":
+                    text_parts.append(part.text)
+    return "\n".join(text_parts).strip() or "Не удалось получить ответ."
 
-    return "Извини, не смог обработать запрос. Попробуй ещё раз."
+
+async def _ask_gpt_fallback(messages: list[dict]) -> str:
+    """Fallback: Chat Completions без поиска."""
+    full_messages = [{"role": "system", "content": SYSTEM_PROMPT}] + [
+        m for m in messages if m.get("role") in ("user", "assistant")
+    ]
+    response = await client.chat.completions.create(
+        model="gpt-4o",
+        messages=full_messages,
+        max_tokens=1500,
+    )
+    return response.choices[0].message.content.strip()
 
 
 async def transcribe_voice(audio_url: str, bot_token: str) -> str:
@@ -143,7 +120,7 @@ async def transcribe_voice(audio_url: str, bot_token: str) -> str:
 
 
 async def describe_image(image_url: str, user_text: str | None = None) -> str:
-    """Проанализировать изображение через GPT-4o Vision."""
+    """Проанализировать изображение через GPT-4o Vision (Chat Completions)."""
     question = user_text if user_text else "Что изображено на этом фото? Опиши подробно."
     response = await client.chat.completions.create(
         model="gpt-4o",
